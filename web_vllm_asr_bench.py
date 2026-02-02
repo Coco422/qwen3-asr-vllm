@@ -36,14 +36,29 @@ INDEX_HTML = r"""<!doctype html>
   <body>
     <h2>Qwen3-ASR vLLM Bench</h2>
     <div class="card">
+      <h3 style="margin-top: 0;">Microphone Recording</h3>
       <div class="row">
         <button id="btnStart">Start recording</button>
         <button id="btnStop" disabled>Stop & transcribe</button>
-        <span class="muted">Records mic audio, encodes WAV 16k mono, sends to this server, which proxies to vLLM.</span>
+        <span class="muted">Records mic audio, encodes WAV 16k mono.</span>
       </div>
       <div style="height: 8px"></div>
       <div id="status" class="muted">Idle.</div>
-      <div style="height: 12px"></div>
+      <div style="height: 4px"></div>
+      <div id="recordingTime" class="muted" style="font-size: 18px; font-weight: 600;">00:00</div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <h3 style="margin-top: 0;">Upload Audio File</h3>
+      <div class="row">
+        <input type="file" id="fileInput" accept="audio/*" style="padding: 8px;" />
+        <button id="btnUpload">Upload & transcribe</button>
+        <span class="muted">Supports WAV, MP3, FLAC, etc.</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <h3 style="margin-top: 0;">Results</h3>
       <div>
         <div><span class="k">Audio seconds</span><span id="audioSec">-</span></div>
         <div><span class="k">vLLM seconds</span><span id="vllmSec">-</span></div>
@@ -59,7 +74,10 @@ INDEX_HTML = r"""<!doctype html>
     <script>
       const btnStart = document.getElementById("btnStart");
       const btnStop = document.getElementById("btnStop");
+      const btnUpload = document.getElementById("btnUpload");
+      const fileInput = document.getElementById("fileInput");
       const statusEl = document.getElementById("status");
+      const recordingTimeEl = document.getElementById("recordingTime");
       const outEl = document.getElementById("out");
       const errEl = document.getElementById("err");
       const audioSecEl = document.getElementById("audioSec");
@@ -71,6 +89,8 @@ INDEX_HTML = r"""<!doctype html>
       let mediaRecorder = null;
       let audioChunks = [];
       let stream = null;
+      let recordingStartTime = 0;
+      let recordingTimer = null;
 
       function setStatus(msg, ok=false) {
         statusEl.textContent = msg;
@@ -79,6 +99,28 @@ INDEX_HTML = r"""<!doctype html>
 
       function setError(msg) {
         errEl.textContent = msg || "";
+      }
+
+      function formatTime(seconds) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      }
+
+      function updateRecordingTime() {
+        if (recording) {
+          const elapsed = (Date.now() - recordingStartTime) / 1000;
+          recordingTimeEl.textContent = formatTime(elapsed);
+        }
+      }
+
+      function clearResults() {
+        outEl.textContent = "-";
+        audioSecEl.textContent = "-";
+        vllmSecEl.textContent = "-";
+        clientSecEl.textContent = "-";
+        rtfEl.textContent = "-";
+        setError("");
       }
 
       function downsampleBuffer(buffer, inRate, outRate) {
@@ -148,13 +190,9 @@ INDEX_HTML = r"""<!doctype html>
       }
 
       async function startRec() {
-        setError("");
-        outEl.textContent = "-";
-        audioSecEl.textContent = "-";
-        vllmSecEl.textContent = "-";
-        clientSecEl.textContent = "-";
-        rtfEl.textContent = "-";
+        clearResults();
         setStatus("Requesting microphone...");
+        recordingTimeEl.textContent = "00:00";
 
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioChunks = [];
@@ -174,8 +212,12 @@ INDEX_HTML = r"""<!doctype html>
 
         mediaRecorder.start(100); // Collect data every 100ms
         recording = true;
+        recordingStartTime = Date.now();
+        recordingTimer = setInterval(updateRecordingTime, 100);
         btnStart.disabled = true;
         btnStop.disabled = false;
+        btnUpload.disabled = true;
+        fileInput.disabled = true;
         setStatus("Recording...");
       }
 
@@ -184,6 +226,10 @@ INDEX_HTML = r"""<!doctype html>
         setStatus("Stopping recording...");
 
         recording = false;
+        if (recordingTimer) {
+          clearInterval(recordingTimer);
+          recordingTimer = null;
+        }
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
           mediaRecorder.stop();
         }
@@ -235,6 +281,8 @@ INDEX_HTML = r"""<!doctype html>
           setStatus("Failed.");
           setError(data.error || `HTTP ${resp.status}`);
           btnStart.disabled = false;
+          btnUpload.disabled = false;
+          fileInput.disabled = false;
           return;
         }
 
@@ -243,6 +291,8 @@ INDEX_HTML = r"""<!doctype html>
         rtfEl.textContent = (data.rtf ?? 0).toFixed(3);
         setStatus(`OK (model: ${data.model || "?"})`, true);
         btnStart.disabled = false;
+        btnUpload.disabled = false;
+        fileInput.disabled = false;
       }
 
       btnStart.addEventListener("click", async () => {
@@ -260,8 +310,80 @@ INDEX_HTML = r"""<!doctype html>
           setError(String(e));
           btnStart.disabled = false;
           btnStop.disabled = true;
+          btnUpload.disabled = false;
+          fileInput.disabled = false;
         }
       });
+
+      async function uploadAndTranscribe() {
+        const file = fileInput.files[0];
+        if (!file) {
+          setError("Please select a file first.");
+          return;
+        }
+
+        clearResults();
+        btnUpload.disabled = true;
+        btnStart.disabled = true;
+        fileInput.disabled = true;
+        setStatus("Processing uploaded file...");
+
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+          const inputSampleRate = audioBuffer.sampleRate;
+          const channelData = audioBuffer.getChannelData(0);
+          const targetRate = 16000;
+          const downsampled = downsampleBuffer(channelData, inputSampleRate, targetRate);
+          const pcm16 = floatTo16BitPCM(downsampled);
+          const wav = encodeWav(pcm16, targetRate);
+          const audioSec = (pcm16.length / targetRate);
+          audioSecEl.textContent = audioSec.toFixed(3);
+
+          const payload = {
+            wav_base64: arrayBufferToBase64(wav),
+            filename: file.name,
+          };
+
+          setStatus("Transcribing via vLLM...");
+          const t0 = performance.now();
+          const resp = await fetch("/api/transcribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const t1 = performance.now();
+          clientSecEl.textContent = ((t1 - t0) / 1000).toFixed(3);
+
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            setStatus("Failed.");
+            setError(data.error || `HTTP ${resp.status}`);
+            btnStart.disabled = false;
+            btnUpload.disabled = false;
+            fileInput.disabled = false;
+            return;
+          }
+
+          outEl.textContent = data.text || "";
+          vllmSecEl.textContent = (data.vllm_seconds ?? 0).toFixed(3);
+          rtfEl.textContent = (data.rtf ?? 0).toFixed(3);
+          setStatus(`OK (model: ${data.model || "?"})`, true);
+          btnStart.disabled = false;
+          btnUpload.disabled = false;
+          fileInput.disabled = false;
+        } catch (e) {
+          setStatus("Failed.");
+          setError(String(e));
+          btnStart.disabled = false;
+          btnUpload.disabled = false;
+          fileInput.disabled = false;
+        }
+      }
+
+      btnUpload.addEventListener("click", uploadAndTranscribe);
     </script>
   </body>
 </html>
