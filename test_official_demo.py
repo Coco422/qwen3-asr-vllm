@@ -28,14 +28,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test the official Qwen3-ASR demo launcher (qwen-asr-demo).")
     parser.add_argument(
         "--asr-checkpoint",
-        default="./model/Qwen3-ASR-1.7B",
-        help="Local path or HF model id (default: ./model/Qwen3-ASR-1.7B)",
+        default="./model/Qwen3-ASR-0.6B",
+        help="Local path or HF model id (default: ./model/Qwen3-ASR-0.6B)",
     )
     parser.add_argument("--backend", default="transformers", choices=["transformers", "vllm"])
     parser.add_argument("--cuda-visible-devices", default="0")
     parser.add_argument("--ip", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--timeout", type=int, default=300, help="Seconds to wait for the demo to become reachable.")
+    parser.add_argument(
+        "--grace",
+        type=int,
+        default=3,
+        help="Seconds to ensure the demo process stays alive after it becomes reachable (default: 3).",
+    )
     parser.add_argument(
         "--stay",
         action="store_true",
@@ -93,6 +99,13 @@ def main() -> int:
             print("Staying alive. Press Ctrl-C to stop.")
             proc.wait()
             return proc.returncode or 0
+
+        if args.grace > 0:
+            time.sleep(args.grace)
+        exit_code = proc.poll()
+        if exit_code is not None:
+            print(f"ERROR: demo exited early (code {exit_code}).", file=sys.stderr)
+            return 3
         return 0
     except KeyboardInterrupt:
         return 130
@@ -103,5 +116,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
